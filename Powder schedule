@@ -1,0 +1,466 @@
+powder_scheduler/
+├─ app.py
+├─ models.py
+├─ forms.py
+├─ requirements.txt
+├─ static/
+│  └─ custom.js
+└─ templates/
+   ├─ base.html
+   ├─ index.html
+   ├─ job_form.html
+   ├─ job_detail.html
+   └─ capacity.html
+Flask==3.0.3
+Flask-SQLAlchemy==3.1.1
+Flask-WTF==1.2.1
+WTForms==3.1.2
+python-dateutil==2.9.0.post0
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
+
+db = SQLAlchemy()
+
+STATUSES = ["Pending", "In Progress", "Curing", "Completed", "Picked Up"]
+PRIORITIES = ["Low", "Normal", "High", "Rush"]
+
+class Job(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    customer = db.Column(db.String(120), nullable=False)
+    contact = db.Column(db.String(120))
+    phone = db.Column(db.String(50))
+    email = db.Column(db.String(120))
+
+    part = db.Column(db.String(200), nullable=False)
+    color = db.Column(db.String(120), nullable=False)
+    notes = db.Column(db.Text)
+
+    status = db.Column(db.String(30), default="Pending", nullable=False)
+    priority = db.Column(db.String(20), default="Normal", nullable=False)
+    oven = db.Column(db.String(80))  # e.g., "Oven A", "Oven B"
+
+    # time estimates (in minutes)
+    prep_min = db.Column(db.Integer, default=0)
+    coat_min = db.Column(db.Integer, default=0)
+    cure_min = db.Column(db.Integer, default=0)
+
+    due_date = db.Column(db.Date)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def total_minutes(self):
+        return (self.prep_min or 0) + (self.coat_min or 0) + (self.cure_min or 0)
+from flask_wtf import FlaskForm
+from wtforms import StringField, TextAreaField, SelectField, IntegerField, DateField, SubmitField
+from wtforms.validators import DataRequired, Optional, NumberRange
+from models import STATUSES, PRIORITIES
+
+class JobForm(FlaskForm):
+    customer = StringField("Customer", validators=[DataRequired()])
+    contact = StringField("Contact", validators=[Optional()])
+    phone = StringField("Phone", validators=[Optional()])
+    email = StringField("Email", validators=[Optional()])
+
+    part = StringField("Part", validators=[DataRequired()])
+    color = StringField("Color", validators=[DataRequired()])
+    notes = TextAreaField("Notes", validators=[Optional()])
+
+    status = SelectField("Status", choices=[(s, s) for s in STATUSES], default="Pending")
+    priority = SelectField("Priority", choices=[(p, p) for p in PRIORITIES], default="Normal")
+    oven = StringField("Oven (e.g., Oven A)", validators=[Optional()])
+
+    prep_min = IntegerField("Prep (min)", validators=[Optional(), NumberRange(min=0)])
+    coat_min = IntegerField("Coat (min)", validators=[Optional(), NumberRange(min=0)])
+    cure_min = IntegerField("Cure (min)", validators=[Optional(), NumberRange(min=0)])
+
+    due_date = DateField("Due Date", validators=[Optional()])
+    submit = SubmitField("Save")
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from models import db, Job, STATUSES, PRIORITIES
+from forms import JobForm
+from datetime import date
+from dateutil import parser
+import os
+
+def create_app():
+    app = Flask(__name__)
+    app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-key")
+    app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", "sqlite:///powder_scheduler.db")
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+    db.init_app(app)
+    with app.app_context():
+        db.create_all()
+
+    @app.route("/")
+    def index():
+        q_status = request.args.get("status")
+        q_priority = request.args.get("priority")
+        q_oven = request.args.get("oven")
+        q_search = request.args.get("q")
+        q_sort = request.args.get("sort", "due")  # due|priority|created
+
+        jobs = Job.query
+        if q_status and q_status != "All":
+            jobs = jobs.filter(Job.status == q_status)
+        if q_priority and q_priority != "All":
+            jobs = jobs.filter(Job.priority == q_priority)
+        if q_oven:
+            jobs = jobs.filter(Job.oven.ilike(f"%{q_oven}%"))
+        if q_search:
+            like = f"%{q_search}%"
+            jobs = jobs.filter(
+                (Job.customer.ilike(like)) |
+                (Job.part.ilike(like)) |
+                (Job.color.ilike(like)) |
+                (Job.notes.ilike(like))
+            )
+
+        if q_sort == "priority":
+            # Rush > High > Normal > Low
+            priority_rank = {p: i for i, p in enumerate(["Rush", "High", "Normal", "Low"])}
+            jobs = sorted(jobs.all(), key=lambda j: (priority_rank.get(j.priority, 99), j.due_date or date.max))
+        elif q_sort == "created":
+            jobs = jobs.order_by(Job.created_at.desc()).all()
+        else:
+            jobs = jobs.order_by(Job.due_date.asc().nullslast(), Job.created_at.asc()).all()
+
+        return render_template("index.html", jobs=jobs, STATUSES=STATUSES, PRIORITIES=PRIORITIES)
+
+    @app.route("/job/new", methods=["GET", "POST"])
+    def job_new():
+        form = JobForm()
+        if form.validate_on_submit():
+            job = Job(
+                customer=form.customer.data,
+                contact=form.contact.data,
+                phone=form.phone.data,
+                email=form.email.data,
+                part=form.part.data,
+                color=form.color.data,
+                notes=form.notes.data,
+                status=form.status.data,
+                priority=form.priority.data,
+                oven=form.oven.data,
+                prep_min=form.prep_min.data or 0,
+                coat_min=form.coat_min.data or 0,
+                cure_min=form.cure_min.data or 0,
+                due_date=form.due_date.data
+            )
+            db.session.add(job)
+            db.session.commit()
+            flash("Job created.", "success")
+            return redirect(url_for("index"))
+        return render_template("job_form.html", form=form, title="New Job")
+
+    @app.route("/job/<int:job_id>", methods=["GET", "POST"])
+    def job_detail(job_id):
+        job = Job.query.get_or_404(job_id)
+        form = JobForm(obj=job)
+        if form.validate_on_submit():
+            form.populate_obj(job)
+            job.prep_min = form.prep_min.data or 0
+            job.coat_min = form.coat_min.data or 0
+            job.cure_min = form.cure_min.data or 0
+            db.session.commit()
+            flash("Job updated.", "success")
+            return redirect(url_for("job_detail", job_id=job.id))
+        return render_template("job_detail.html", job=job, form=form)
+
+    @app.route("/job/<int:job_id>/delete", methods=["POST"])
+    def job_delete(job_id):
+        job = Job.query.get_or_404(job_id)
+        db.session.delete(job)
+        db.session.commit()
+        flash("Job deleted.", "info")
+        return redirect(url_for("index"))
+
+    @app.route("/job/<int:job_id>/status", methods=["POST"])
+    def job_status(job_id):
+        job = Job.query.get_or_404(job_id)
+        status = request.form.get("status")
+        if status in STATUSES:
+            job.status = status
+            db.session.commit()
+            flash(f"Status updated to {status}.", "success")
+        else:
+            flash("Invalid status.", "danger")
+        return redirect(request.referrer or url_for("index"))
+
+    @app.route("/job/<int:job_id>/quick", methods=["POST"])
+    def job_quick(job_id):
+        """Quick inline updates via fetch/AJAX"""
+        job = Job.query.get_or_404(job_id)
+        data = request.get_json(force=True)
+        changed = False
+        if "notes" in data:
+            job.notes = data["notes"]
+            changed = True
+        if "oven" in data:
+            job.oven = data["oven"]
+            changed = True
+        if "due_date" in data:
+            job.due_date = parser.parse(data["due_date"]).date() if data["due_date"] else None
+            changed = True
+        if "status" in data and data["status"] in STATUSES:
+            job.status = data["status"]
+            changed = True
+        if changed:
+            db.session.commit()
+        return jsonify({"ok": True})
+
+    @app.route("/capacity")
+    def capacity():
+        """Simple capacity view: jobs grouped by due_date and oven."""
+        jobs = Job.query.order_by(Job.due_date.asc().nullslast(), Job.oven.asc().nullslast()).all()
+        # Build nested dict: {date: {oven: [jobs]}}
+        buckets = {}
+        for j in jobs:
+            key_date = j.due_date.isoformat() if j.due_date else "No Due Date"
+            oven = j.oven or "Unassigned"
+            buckets.setdefault(key_date, {}).setdefault(oven, []).append(j)
+        return render_template("capacity.html", buckets=buckets)
+    return app
+
+if __name__ == "__main__":
+    app = create_app()
+    app.run(debug=True)
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Powder Coat Scheduler</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Bootstrap CSS via CDN -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="{{ url_for('index') }}">Powder Scheduler</a>
+    <div class="navbar-nav">
+      <a class="nav-link" href="{{ url_for('job_new') }}">New Job</a>
+      <a class="nav-link" href="{{ url_for('capacity') }}">Capacity</a>
+    </div>
+  </div>
+</nav>
+<main class="container py-4">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="mb-3">
+        {% for category, msg in messages %}
+          <div class="alert alert-{{ category }}">{{ msg }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="{{ url_for('static', filename='custom.js') }}"></script>
+</body>
+</html>
+{% extends "base.html" %}
+{% block content %}
+<h3 class="mb-3">Jobs</h3>
+
+<form class="row g-2 mb-3">
+  <div class="col-12 col-md-2">
+    <select name="status" class="form-select">
+      <option {% if request.args.get('status') in [None, 'All'] %}selected{% endif %}>All</option>
+      {% for s in STATUSES %}
+        <option value="{{ s }}" {% if request.args.get('status') == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-12 col-md-2">
+    <select name="priority" class="form-select">
+      <option {% if request.args.get('priority') in [None, 'All'] %}selected{% endif %}>All</option>
+      {% for p in PRIORITIES %}
+        <option value="{{ p }}" {% if request.args.get('priority') == p %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-12 col-md-2">
+    <input name="oven" class="form-control" placeholder="Oven filter" value="{{ request.args.get('oven','') }}">
+  </div>
+  <div class="col-12 col-md-3">
+    <input name="q" class="form-control" placeholder="Search customer/part/color/notes" value="{{ request.args.get('q','') }}">
+  </div>
+  <div class="col-12 col-md-2">
+    <select name="sort" class="form-select">
+      <option value="due" {% if request.args.get('sort','due') == 'due' %}selected{% endif %}>Sort by Due</option>
+      <option value="priority" {% if request.args.get('sort') == 'priority' %}selected{% endif %}>Sort by Priority</option>
+      <option value="created" {% if request.args.get('sort') == 'created' %}selected{% endif %}>Sort by Created</option>
+    </select>
+  </div>
+  <div class="col-12 col-md-1 d-grid">
+    <button class="btn btn-primary" type="submit">Apply</button>
+  </div>
+</form>
+
+<div class="table-responsive">
+<table class="table table-hover align-middle bg-white">
+  <thead class="table-light">
+    <tr>
+      <th>ID</th>
+      <th>Customer</th>
+      <th>Part</th>
+      <th>Color</th>
+      <th>Status</th>
+      <th>Priority</th>
+      <th>Oven</th>
+      <th>Due</th>
+      <th>Total Min</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for j in jobs %}
+    <tr>
+      <td>#{{ j.id }}</td>
+      <td>{{ j.customer }}</td>
+      <td>{{ j.part }}</td>
+      <td>{{ j.color }}</td>
+      <td>
+        <form method="post" action="{{ url_for('job_status', job_id=j.id) }}">
+          <select name="status" class="form-select form-select-sm" onchange="this.form.submit()">
+            {% for s in STATUSES %}
+              <option value="{{ s }}" {% if j.status == s %}selected{% endif %}>{{ s }}</option>
+            {% endfor %}
+          </select>
+        </form>
+      </td>
+      <td>{{ j.priority }}</td>
+      <td>
+        <input class="form-control form-control-sm" value="{{ j.oven or '' }}"
+               onblur="quickUpdate({{ j.id }}, {oven: this.value})">
+      </td>
+      <td>
+        <input type="date" class="form-control form-control-sm" value="{{ j.due_date or '' }}"
+               onblur="quickUpdate({{ j.id }}, {due_date: this.value})">
+      </td>
+      <td>{{ j.total_minutes() }}</td>
+      <td class="text-end">
+        <a href="{{ url_for('job_detail', job_id=j.id) }}" class="btn btn-sm btn-outline-secondary">Open</a>
+        <form class="d-inline" method="post" action="{{ url_for('job_delete', job_id=j.id) }}"
+              onsubmit="return confirm('Delete job #{{ j.id }}?')">
+          <button class="btn btn-sm btn-outline-danger">Delete</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% if not jobs %}
+<div class="alert alert-info">No jobs yet. Add one!</div>
+{% endif %}
+{% endblock %}
+{% extends "base.html" %}
+{% block content %}
+<h3 class="mb-3">{{ title }}</h3>
+<form method="post" novalidate>
+  {{ form.hidden_tag() }}
+  <div class="row g-3">
+    <div class="col-md-4">{{ form.customer.label }} {{ form.customer(class="form-control") }}</div>
+    <div class="col-md-4">{{ form.contact.label }} {{ form.contact(class="form-control") }}</div>
+    <div class="col-md-2">{{ form.phone.label }} {{ form.phone(class="form-control") }}</div>
+    <div class="col-md-2">{{ form.email.label }} {{ form.email(class="form-control") }}</div>
+
+    <div class="col-md-4">{{ form.part.label }} {{ form.part(class="form-control") }}</div>
+    <div class="col-md-4">{{ form.color.label }} {{ form.color(class="form-control") }}</div>
+    <div class="col-md-4">{{ form.oven.label }} {{ form.oven(class="form-control") }}</div>
+
+    <div class="col-md-3">{{ form.prep_min.label }} {{ form.prep_min(class="form-control") }}</div>
+    <div class="col-md-3">{{ form.coat_min.label }} {{ form.coat_min(class="form-control") }}</div>
+    <div class="col-md-3">{{ form.cure_min.label }} {{ form.cure_min(class="form-control") }}</div>
+    <div class="col-md-3">{{ form.priority.label }} {{ form.priority(class="form-select") }}</div>
+
+    <div class="col-md-3">{{ form.status.label }} {{ form.status(class="form-select") }}</div>
+    <div class="col-md-3">{{ form.due_date.label }} {{ form.due_date(class="form-control") }}</div>
+    <div class="col-12">{{ form.notes.label }} {{ form.notes(class="form-control", rows="4") }}</div>
+  </div>
+  <div class="mt-3 d-flex gap-2">
+    {{ form.submit(class="btn btn-primary") }}
+    <a href="{{ url_for('index') }}" class="btn btn-secondary">Cancel</a>
+  </div>
+</form>
+{% endblock %}
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center">
+  <h3>Job #{{ job.id }} — {{ job.customer }}</h3>
+  <form method="post" action="{{ url_for('job_status', job_id=job.id) }}">
+    <div class="input-group">
+      <label class="input-group-text">Status</label>
+      <select name="status" class="form-select" onchange="this.form.submit()">
+        {% for s in STATUSES %}
+          <option value="{{ s }}" {% if job.status == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </form>
+</div>
+<p class="text-muted">Created {{ job.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
+
+<form method="post">
+  {{ form.hidden_tag() }}
+  {% include "job_form.html" without context %}
+</form>
+
+<div class="card mt-4">
+  <div class="card-body">
+    <h5 class="card-title">Quick Notes</h5>
+    <textarea class="form-control" rows="4" onblur="quickUpdate({{ job.id }}, {notes: this.value})">{{ job.notes or '' }}</textarea>
+  </div>
+</div>
+{% endblock %}
+{% extends "base.html" %}
+{% block content %}
+<h3 class="mb-3">Capacity by Due Date & Oven</h3>
+{% for day, ovens in buckets.items() %}
+  <div class="mb-4">
+    <h5 class="border-bottom pb-1">{{ day }}</h5>
+    <div class="row g-3">
+      {% for oven, jobs in ovens.items() %}
+        <div class="col-md-6">
+          <div class="card">
+            <div class="card-header">{{ oven }}</div>
+            <ul class="list-group list-group-flush">
+              {% for j in jobs %}
+                <li class="list-group-item d-flex justify-content-between">
+                  <div>
+                    <strong>#{{ j.id }}</strong> {{ j.customer }} — {{ j.part }} ({{ j.color }})
+                    <div class="small text-muted">{{ j.status }} • {{ j.priority }}</div>
+                  </div>
+                  <span class="badge bg-secondary align-self-center">{{ j.total_minutes() }} min</span>
+                </li>
+              {% endfor %}
+            </ul>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+{% else %}
+  <div class="alert alert-info">No jobs scheduled.</div>
+{% endfor %}
+{% endblock %}
+async function quickUpdate(id, payload) {
+  try {
+    await fetch(`/job/${id}/quick`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+  } catch (e) {
+    alert("Update failed");
+  }
+}
+# from project folder
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python app.py
+# Open http://127.0.0.1:5000
