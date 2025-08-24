@@ -1,16 +1,10 @@
-powder_scheduler/
-├─ app.py
-├─ models.py
-├─ forms.py
-├─ requirements.txt
-├─ static/
-│  └─ custom.js
-└─ templates/
-   ├─ base.html
-   ├─ index.html
-   ├─ job_form.html
-   ├─ job_detail.html
-   └─ capacity.html
+repo-root/
+└─ powder_scheduler/
+   ├─ app.py
+   ├─ models.py
+   ├─ forms.py
+   ├─ requirements.txt
+   ├─ static
 Flask==3.0.3
 Flask-SQLAlchemy==3.1.1
 Flask-WTF==1.2.1
