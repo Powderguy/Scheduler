@@ -1,91 +1,153 @@
 powder_scheduler/
-│
 ├── app.py
+├── config.py
+├── models.py
+├── forms.py
 ├── requirements.txt
+├── render.yaml
+├── static/
+│   └── styles.css
 └── templates/
-    └── index.html
-from flask import Flask, render_template, request, redirect, url_for
+    ├── base.html
+    ├── index.html
+    ├── job_form.html
+    ├── job_detail.html
+    └── 404.html
+Flask==2.3.2
+Flask-SQLAlchemy==3.0.3
+Flask-WTF==1.1.1
+WTForms==3.0.1
+gunicorn==21.2.0
+python-dotenv==1.0.0
+services:
+  - type: web
+    name: powder-scheduler
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app"
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        value: sqlite:///scheduler.db
+import os
+basedir = os.path.abspath(os.path.dirname(__file__))
+
+class Config:
+    SECRET_KEY = os.environ.get('SECRET_KEY', 'change-this-secret')
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///' + os.path.join(basedir, 'scheduler.db')
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 
-app = Flask(__name__)
+db = SQLAlchemy()
 
-# In-memory storage for simplicity. For production, use a database.
-jobs = []
+class Job(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    client_name = db.Column(db.String(120), nullable=False)
+    item = db.Column(db.String(120), nullable=False)
+    color = db.Column(db.String(80), nullable=False)
+    quantity = db.Column(db.Integer, default=1)
+    description = db.Column(db.Text, nullable=True)
+    status = db.Column(db.String(30), default='Pending')  # Pending, In Progress, Completed, Cancelled
+    scheduled_date = db.Column(db.Date, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<Job {self.id} {self.client_name} - {self.item}>'
+from flask_wtf import FlaskForm
+from wtforms import StringField, TextAreaField, IntegerField, SelectField, DateField, SubmitField
+from wtforms.validators import DataRequired, NumberRange
+
+class JobForm(FlaskForm):
+    client_name = StringField('Client name', validators=[DataRequired()])
+    item = StringField('Item', validators=[DataRequired()])
+    color = StringField('Color / Finish', validators=[DataRequired()])
+    quantity = IntegerField('Quantity', validators=[DataRequired(), NumberRange(min=1)])
+    scheduled_date = DateField('Scheduled date (YYYY-MM-DD)', format='%Y-%m-%d', validators=[], description='Optional')
+    status = SelectField('Status', choices=[('Pending', 'Pending'), ('In Progress', 'In Progress'), ('Completed', 'Completed'), ('Cancelled', 'Cancelled')])
+    description = TextAreaField('Description / Notes')
+    submit = SubmitField('Save')
+from flask import Flask, render_template, redirect, url_for, request, flash, abort
+from config import Config
+from models import db, Job
+from forms import JobForm
+from datetime import date
+
+app = Flask(__name__)
+app.config.from_object(Config)
+db.init_app(app)
+
+with app.app_context():
+    db.create_all()
 
 @app.route('/')
 def index():
-    return render_template('index.html', jobs=jobs)
+    today = date.today()
+    upcoming = Job.query.filter(Job.scheduled_date >= today).order_by(Job.scheduled_date.asc()).all()
+    others = Job.query.filter((Job.scheduled_date == None) | (Job.scheduled_date < today)).order_by(Job.created_at.desc()).all()
+    return render_template('index.html', upcoming=upcoming, others=others)
 
-@app.route('/add', methods=['POST'])
-def add_job():
-    job_name = request.form.get('job_name')
-    job_date = request.form.get('job_date')
-    if job_name and job_date:
-        jobs.append({
-            'name': job_name,
-            'date': job_date,
-            'completed': False
-        })
-    return redirect(url_for('index'))
+@app.route('/job/new', methods=['GET', 'POST'])
+def new_job():
+    form = JobForm()
+    if form.validate_on_submit():
+        job = Job(
+            client_name=form.client_name.data,
+            item=form.item.data,
+            color=form.color.data,
+            quantity=form.quantity.data,
+            scheduled_date=form.scheduled_date.data,
+            status=form.status.data,
+            description=form.description.data
+        )
+        db.session.add(job)
+        db.session.commit()
+        flash('Job created!', 'success')
+        return redirect(url_for('index'))
+    return render_template('job_form.html', form=form, title='New Job')
 
-@app.route('/complete/<int:job_id>')
-def complete_job(job_id):
-    if 0 <= job_id < len(jobs):
-        jobs[job_id]['completed'] = True
-    return redirect(url_for('index'))
+@app.route('/job/<int:job_id>/edit', methods=['GET', 'POST'])
+def edit_job(job_id):
+    job = Job.query.get_or_404(job_id)
+    form = JobForm(obj=job)
+    if form.validate_on_submit():
+        form.populate_obj(job)
+        db.session.commit()
+        flash('Job updated!', 'success')
+        return redirect(url_for('index'))
+    return render_template('job_form.html', form=form, title='Edit Job')
 
-@app.route('/delete/<int:job_id>')
+@app.route('/job/<int:job_id>')
+def job_detail(job_id):
+    job = Job.query.get_or_404(job_id)
+    return render_template('job_detail.html', job=job)
+
+@app.route('/job/<int:job_id>/delete', methods=['POST'])
 def delete_job(job_id):
-    if 0 <= job_id < len(jobs):
-        jobs.pop(job_id)
+    job = Job.query.get_or_404(job_id)
+    db.session.delete(job)
+    db.session.commit()
+    flash('Job deleted', 'info')
     return redirect(url_for('index'))
+
+@app.route('/job/<int:job_id>/status/<string:new_status>', methods=['POST'])
+def update_status(job_id, new_status):
+    allowed = ['Pending', 'In Progress', 'Completed', 'Cancelled']
+    if new_status not in allowed:
+        abort(400)
+    job = Job.query.get_or_404(job_id)
+    job.status = new_status
+    db.session.commit()
+    return ('', 204)
+
+@app.errorhandler(404)
+def page_not_found(e):
+    return render_template('404.html'), 404
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Powder Coating Scheduler</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; }
-        h1 { color: #d9534f; }
-        table { width: 50%; border-collapse: collapse; margin-top: 20px; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        tr.completed { background-color: #d4edda; }
-        button { margin-left: 5px; }
-    </style>
-</head>
-<body>
-    <h1>Powder Coating Scheduler</h1>
-    
-    <form action="/add" method="post">
-        <input type="text" name="job_name" placeholder="Job Name" required>
-        <input type="date" name="job_date" required>
-        <button type="submit">Add Job</button>
-    </form>
-    
-    <table>
-        <tr>
-            <th>Job Name</th>
-            <th>Date</th>
-            <th>Status</th>
-            <th>Actions</th>
-        </tr>
-        {% for job in jobs %}
-        <tr class="{{ 'completed' if job.completed }}">
-            <td>{{ job.name }}</td>
-            <td>{{ job.date }}</td>
-            <td>{{ 'Completed' if job.completed else 'Pending' }}</td>
-            <td>
-                {% if not job.completed %}
-                <a href="/complete/{{ loop.index0 }}"><button>Complete</button></a>
-                {% endif %}
-                <a href="/delete/{{ loop.index0 }}"><button>Delete</button></a>
-            </td>
-        </tr>
-        {% endfor %}
-    </table>
-</body>
-</html>
-Flask==2.3.4
+    app.run(debug=True)
+body { padding-bottom: 40px; }
+.card { box-shadow: 0 2px 6px rgba(0,0,0,0.05); }
