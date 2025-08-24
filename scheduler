@@ -1,0 +1,91 @@
+powder_scheduler/
+│
+├── app.py
+├── requirements.txt
+└── templates/
+    └── index.html
+from flask import Flask, render_template, request, redirect, url_for
+from datetime import datetime
+
+app = Flask(__name__)
+
+# In-memory storage for simplicity. For production, use a database.
+jobs = []
+
+@app.route('/')
+def index():
+    return render_template('index.html', jobs=jobs)
+
+@app.route('/add', methods=['POST'])
+def add_job():
+    job_name = request.form.get('job_name')
+    job_date = request.form.get('job_date')
+    if job_name and job_date:
+        jobs.append({
+            'name': job_name,
+            'date': job_date,
+            'completed': False
+        })
+    return redirect(url_for('index'))
+
+@app.route('/complete/<int:job_id>')
+def complete_job(job_id):
+    if 0 <= job_id < len(jobs):
+        jobs[job_id]['completed'] = True
+    return redirect(url_for('index'))
+
+@app.route('/delete/<int:job_id>')
+def delete_job(job_id):
+    if 0 <= job_id < len(jobs):
+        jobs.pop(job_id)
+    return redirect(url_for('index'))
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Powder Coating Scheduler</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        h1 { color: #d9534f; }
+        table { width: 50%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        tr.completed { background-color: #d4edda; }
+        button { margin-left: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Powder Coating Scheduler</h1>
+    
+    <form action="/add" method="post">
+        <input type="text" name="job_name" placeholder="Job Name" required>
+        <input type="date" name="job_date" required>
+        <button type="submit">Add Job</button>
+    </form>
+    
+    <table>
+        <tr>
+            <th>Job Name</th>
+            <th>Date</th>
+            <th>Status</th>
+            <th>Actions</th>
+        </tr>
+        {% for job in jobs %}
+        <tr class="{{ 'completed' if job.completed }}">
+            <td>{{ job.name }}</td>
+            <td>{{ job.date }}</td>
+            <td>{{ 'Completed' if job.completed else 'Pending' }}</td>
+            <td>
+                {% if not job.completed %}
+                <a href="/complete/{{ loop.index0 }}"><button>Complete</button></a>
+                {% endif %}
+                <a href="/delete/{{ loop.index0 }}"><button>Delete</button></a>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+</body>
+</html>
+Flask==2.3.4
